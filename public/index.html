@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delhi Video Chat</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --text:#e8eaf0; --muted:#8b93a5; --accent:#4f8cff; --danger:#e5484d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; min-height:100vh; display:flex; flex-direction:column; }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  select, button { font:inherit; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--text); padding:10px 14px; }
+  button { cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { background:var(--danger); border-color:var(--danger); color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  main { flex:1; display:flex; flex-direction:column; gap:12px; padding:12px; max-width:1100px; width:100%; margin:0 auto; }
+  .videos { position:relative; flex:1; min-height:50vh; background:#000; border-radius:14px; overflow:hidden; border:1px solid var(--line); }
+  #remote { width:100%; height:100%; object-fit:cover; background:#000; }
+  #local { position:absolute; right:12px; bottom:12px; width:28%; max-width:220px; min-width:110px; border-radius:10px; border:2px solid var(--line); background:#111; transform:scaleX(-1); }
+  #status { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px; color:var(--muted); font-size:18px; pointer-events:none; }
+  .controls { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  .overlay { position:fixed; inset:0; background:rgba(0,0,0,.8); display:flex; align-items:center; justify-content:center; padding:16px; z-index:10; }
+  .overlay.hidden { display:none; }
+  .modal { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:22px; max-width:440px; width:100%; }
+  .modal h2 { margin-top:0; }
+  .modal ul { color:var(--muted); padding-left:20px; line-height:1.6; }
+  .modal label { display:flex; gap:10px; align-items:flex-start; margin:14px 0; cursor:pointer; }
+  .modal button { width:100%; }
+</style>
+</head>
+<body>
+
+<div id="gate" class="overlay">
+  <div class="modal">
+    <h2>18+ only</h2>
+    <ul>
+      <li>This site is strictly for adults (18 and over).</li>
+      <li>No nudity or sexual content. Anyone who shows it will be reported and banned.</li>
+      <li>No harassment or hate. Be respectful.</li>
+      <li>Strangers can see and hear you. Don't share personal details.</li>
+      <li>Use <b>Report</b> if someone breaks the rules.</li>
+    </ul>
+    <label><input type="checkbox" id="ageCheck"> I confirm I am 18 or older and agree to the rules.</label>
+    <button id="enterBtn" class="primary" disabled>Enter</button>
+  </div>
+</div>
+
+<header>
+  <h1>Delhi Video Chat</h1>
+  <div>
+    <label for="region" style="color:var(--muted);margin-right:6px">Match with:</label>
+    <select id="region">
+      <option value="delhi-ncr">Delhi-NCR</option>
+      <option value="india">All India</option>
+      <option value="world">Anywhere</option>
+    </select>
+  </div>
+</header>
+
+<main>
+  <div class="videos">
+    <video id="remote" autoplay playsinline></video>
+    <video id="local" autoplay playsinline muted></video>
+    <div id="status">Press Start to find someone</div>
+  </div>
+  <div class="controls">
+    <button id="startBtn" class="primary">Start</button>
+    <button id="nextBtn" disabled>Next</button>
+    <button id="reportBtn" class="danger" disabled>Report</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const statusEl = $('status');
+const setStatus = (t) => { statusEl.textContent = t; statusEl.style.display = t ? 'flex' : 'none'; };
+
+let ageConfirmed = false;
+try { ageConfirmed = localStorage.getItem('ageOk') === '1'; } catch {}
+if (ageConfirmed) $('gate').classList.add('hidden');
+$('ageCheck').onchange = (e) => ($('enterBtn').disabled = !e.target.checked);
+$('enterBtn').onclick = () => {
+  ageConfirmed = true;
+  try { localStorage.setItem('ageOk', '1'); } catch {}
+  $('gate').classList.add('hidden');
+};
+
+let ws, pc, localStream, iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+let chain = Promise.resolve();
+
+fetch('/config').then((r) => r.json()).then((c) => { if (c.iceServers) iceServers = c.iceServers; }).catch(() => {});
+
+function setButtons(active) {
+  $('startBtn').disabled = active;
+  $('nextBtn').disabled = !active;
+  $('reportBtn').disabled = !active;
+  $('stopBtn').disabled = !active;
+  $('region').disabled = active;
+}
+
+function closePeer() {
+  if (pc) { pc.ontrack = pc.onicecandidate = pc.onconnectionstatechange = null; pc.close(); pc = null; }
+  $('remote').srcObject = null;
+}
+
+function createPeer() {
+  closePeer();
+  pc = new RTCPeerConnection({ iceServers });
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.ontrack = (e) => { $('remote').srcObject = e.streams[0]; setStatus(''); };
+  pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type: 'signal', data: { candidate: e.candidate } }); };
+  pc.onconnectionstatechange = () => {
+    if (pc && pc.connectionState === 'failed') setStatus('Connection failed. Press Next.');
+  };
+}
+
+function wsSend(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+async function handleSignal(data) {
+  if (!pc) return;
+  try {
+    if (data.description) {
+      await pc.setRemoteDescription(data.description);
+      if (data.description.type === 'offer') {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        wsSend({ type: 'signal', data: { description: pc.localDescription } });
+      }
+    } else if (data.candidate) {
+      await pc.addIceCandidate(data.candidate);
+    }
+  } catch (err) { console.warn('signal error', err); }
+}
+
+async function onMessage(ev) {
+  const msg = JSON.parse(ev.data);
+  switch (msg.type) {
+    case 'waiting':
+      closePeer();
+      setStatus('Looking for someone...');
+      break;
+    case 'matched':
+      setStatus('Connecting...');
+      createPeer();
+      if (msg.initiator) {
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        wsSend({ type: 'signal', data: { description: pc.localDescription } });
+      }
+      break;
+    case 'signal':
+      chain = chain.then(() => handleSignal(msg.data));
+      break;
+    case 'partner-left':
+      closePeer();
+      setStatus('Stranger left. Looking for someone new...');
+      wsSend({ type: 'next' });
+      break;
+    case 'banned':
+      stopAll();
+      setStatus('You have been temporarily banned due to reports.');
+      break;
+    case 'error':
+      setStatus(msg.message);
+      break;
+  }
+}
+
+async function start() {
+  if (!ageConfirmed) { $('gate').classList.remove('hidden'); return; }
+  try {
+    localStream = localStream || await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch {
+    setStatus('Camera and microphone access is required.');
+    return;
+  }
+  $('local').srcObject = localStream;
+  setButtons(true);
+  setStatus('Connecting to server...');
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => wsSend({ type: 'join', region: $('region').value, ageConfirmed: true });
+  ws.onmessage = (ev) => onMessage(ev).catch(console.error);
+  ws.onclose = () => { closePeer(); setButtons(false); if (statusEl.textContent !== 'You have been temporarily banned due to reports.') setStatus('Disconnected. Press Start.'); };
+}
+
+function stopAll() {
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  closePeer();
+  if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
+  $('local').srcObject = null;
+  setButtons(false);
+  setStatus('Press Start to find someone');
+}
+
+$('startBtn').onclick = start;
+$('nextBtn').onclick = () => { closePeer(); setStatus('Looking for someone...'); wsSend({ type: 'next' }); };
+$('reportBtn').onclick = () => {
+  if (!confirm('Report this person and move on?')) return;
+  closePeer(); setStatus('Reported. Looking for someone new...'); wsSend({ type: 'report' });
+};
+$('stopBtn').onclick = stopAll;
+</script>
+</body>
+</html>
